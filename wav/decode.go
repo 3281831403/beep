@@ -86,7 +86,20 @@ func Decode(r io.Reader) (s beep.StreamSeekCloser, format beep.Format, err error
 					0x00000001, 0x0000, 0x0010,
 					[8]byte{0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71},
 				}
-				if fmtchunk.SubFormat != pcmguid {
+				// KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: same base GUID, first word is 3.
+				floatguid := guid{
+					0x00000003, 0x0000, 0x0010,
+					[8]byte{0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71},
+				}
+				switch fmtchunk.SubFormat {
+				case pcmguid:
+					// Normalize to the plain PCM format tag so the rest of the
+					// decoder can treat extensible PCM like any other PCM file.
+					d.h.FormatType = 1
+				case floatguid:
+					// Normalize to WAVE_FORMAT_IEEE_FLOAT (3).
+					d.h.FormatType = 3
+				default:
 					return nil, beep.Format{}, fmt.Errorf(
 						"wav: unsupported sub format type - %08x-%04x-%04x-%s",
 						fmtchunk.SubFormat.Data1, fmtchunk.SubFormat.Data2, fmtchunk.SubFormat.Data3,
@@ -140,7 +153,7 @@ func Decode(r io.Reader) (s beep.StreamSeekCloser, format beep.Format, err error
 	if string(d.h.DataMark[:]) != "data" {
 		return nil, beep.Format{}, errors.New("wav: missing data chunk marker")
 	}
-	if d.h.FormatType != 1 && d.h.FormatType != -2 && d.h.FormatType != 3 {
+	if d.h.FormatType != 1 && d.h.FormatType != 3 {
 		return nil, beep.Format{}, fmt.Errorf("wav: unsupported format type - %d", d.h.FormatType)
 	}
 	if d.h.NumChans <= 0 {
@@ -208,65 +221,98 @@ func (d *decoder) Stream(samples [][2]float64) (n int, ok bool) {
 	if d.err != nil || d.pos >= d.h.DataSize {
 		return 0, false
 	}
-	bytesPerFrame := int(d.h.BytesPerFrame)
-	wantBytes := len(samples) * bytesPerFrame
-	availableBytes := int(d.h.DataSize - d.pos)
-	numBytes := min(wantBytes, availableBytes)
-	p := make([]byte, numBytes)
-	n, err := d.r.Read(p)
-	if err != nil && err != io.EOF {
-		d.err = err
+	if len(samples) == 0 {
+		// An empty request consumes nothing and never signals draining.
+		return 0, true
 	}
+	bytesPerFrame := int(d.h.BytesPerFrame)
+	availableBytes := int(d.h.DataSize - d.pos)
+	wantFrames := min(len(samples), availableBytes/bytesPerFrame)
+	if wantFrames <= 0 {
+		// The data chunk ends with a dangling partial frame. There is no way
+		// to decode a whole frame, so report the truncation explicitly instead
+		// of spinning forever returning empty slices.
+		d.err = io.ErrUnexpectedEOF
+		return 0, false
+	}
+	numBytes := wantFrames * bytesPerFrame
+	p := make([]byte, numBytes)
+	// io.ReadFull keeps reading until p is full or the underlying reader returns
+	// an error, so readers that deliver only a few bytes per Read (e.g. HTTP
+	// streams) don't cause dropped or empty frames.
+	read, readErr := io.ReadFull(d.r, p)
+
+	// Only whole frames can be decoded. Any trailing bytes of a cut-off frame
+	// are discarded; the truncation is reported through d.err below.
+	usableBytes := read - read%bytesPerFrame
 	switch {
 	case d.h.BitsPerSample == 8 && d.h.NumChans == 1:
-		for i, j := 0, 0; i <= n-bytesPerFrame; i, j = i+bytesPerFrame, j+1 {
+		for i, j := 0, 0; i < usableBytes; i, j = i+bytesPerFrame, j+1 {
 			val := float64(p[i])/(1<<8)*2 - 1
 			samples[j][0] = val
 			samples[j][1] = val
 		}
 	case d.h.BitsPerSample == 8 && d.h.NumChans >= 2:
-		for i, j := 0, 0; i <= n-bytesPerFrame; i, j = i+bytesPerFrame, j+1 {
+		for i, j := 0, 0; i < usableBytes; i, j = i+bytesPerFrame, j+1 {
 			samples[j][0] = float64(p[i+0])/(1<<8)*2 - 1
 			samples[j][1] = float64(p[i+1])/(1<<8)*2 - 1
 		}
 	case d.h.BitsPerSample == 16 && d.h.NumChans == 1:
-		for i, j := 0, 0; i <= n-bytesPerFrame; i, j = i+bytesPerFrame, j+1 {
+		for i, j := 0, 0; i < usableBytes; i, j = i+bytesPerFrame, j+1 {
 			val := float64(int16(p[i+0])+int16(p[i+1])*(1<<8)) / (1 << 15)
 			samples[j][0] = val
 			samples[j][1] = val
 		}
 	case d.h.BitsPerSample == 16 && d.h.NumChans >= 2:
-		for i, j := 0, 0; i <= n-bytesPerFrame; i, j = i+bytesPerFrame, j+1 {
+		for i, j := 0, 0; i < usableBytes; i, j = i+bytesPerFrame, j+1 {
 			samples[j][0] = float64(int16(p[i+0])+int16(p[i+1])*(1<<8)) / (1 << 15)
 			samples[j][1] = float64(int16(p[i+2])+int16(p[i+3])*(1<<8)) / (1 << 15)
 		}
 	case d.h.BitsPerSample == 24 && d.h.NumChans == 1:
-		for i, j := 0, 0; i <= n-bytesPerFrame; i, j = i+bytesPerFrame, j+1 {
+		for i, j := 0, 0; i < usableBytes; i, j = i+bytesPerFrame, j+1 {
 			val := float64((int32(p[i+0])<<8)+(int32(p[i+1])<<16)+(int32(p[i+2])<<24)) / (1 << 8) / (1 << 23)
 			samples[j][0] = val
 			samples[j][1] = val
 		}
 	case d.h.BitsPerSample == 24 && d.h.NumChans >= 2:
-		for i, j := 0, 0; i <= n-bytesPerFrame; i, j = i+bytesPerFrame, j+1 {
+		for i, j := 0, 0; i < usableBytes; i, j = i+bytesPerFrame, j+1 {
 			samples[j][0] = float64((int32(p[i+0])<<8)+(int32(p[i+1])<<16)+(int32(p[i+2])<<24)) / (1 << 8) / (1 << 23)
 			samples[j][1] = float64((int32(p[i+3])<<8)+(int32(p[i+4])<<16)+(int32(p[i+5])<<24)) / (1 << 8) / (1 << 23)
 		}
 	case d.h.FormatType == 3 && d.h.BitsPerSample == 32 && d.h.NumChans == 1:
-		for i, j := 0, 0; i <= n-bytesPerFrame; i, j = i+bytesPerFrame, j+1 {
+		for i, j := 0, 0; i < usableBytes; i, j = i+bytesPerFrame, j+1 {
 			val := math.Float32frombits(binary.LittleEndian.Uint32(p[i : i+4]))
 			samples[j][0] = float64(val)
 			samples[j][1] = float64(val)
 		}
 	case d.h.FormatType == 3 && d.h.BitsPerSample == 32 && d.h.NumChans >= 2:
-		for i, j := 0, 0; i <= n-bytesPerFrame; i, j = i+bytesPerFrame, j+1 {
+		for i, j := 0, 0; i < usableBytes; i, j = i+bytesPerFrame, j+1 {
 			left := math.Float32frombits(binary.LittleEndian.Uint32(p[i : i+4]))
 			right := math.Float32frombits(binary.LittleEndian.Uint32(p[i+4 : i+8]))
 			samples[j][0] = float64(left)
 			samples[j][1] = float64(right)
 		}
 	}
-	d.pos += int32(n)
-	return n / bytesPerFrame, true
+	d.pos += int32(usableBytes)
+	frames := usableBytes / bytesPerFrame
+
+	// Surface any failure of the underlying reader. io.ReadFull turns a clean
+	// end-of-stream before the declared DataSize into ErrUnexpectedEOF, so a
+	// truncated upload never looks like a successful, shorter file. The whole
+	// frames decoded above are still delivered; every following call is drained
+	// and Err() reports the truncation.
+	if readErr != nil {
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			d.err = io.ErrUnexpectedEOF
+		} else {
+			d.err = readErr
+		}
+	}
+	if frames == 0 && d.err != nil {
+		// Nothing decodable was delivered: behave like a drained, failed streamer.
+		return 0, false
+	}
+	return frames, true
 }
 
 func (d *decoder) Err() error {
@@ -297,6 +343,9 @@ func (d *decoder) Seek(p int) error {
 		return errors.Wrap(err, "wav: seek error")
 	}
 	d.pos = pos
+	// A successful seek re-positions the underlying reader, so any earlier
+	// streaming error (e.g. a truncation) no longer applies.
+	d.err = nil
 	return nil
 }
 
